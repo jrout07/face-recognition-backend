@@ -234,17 +234,55 @@ app.post('/admin/approve', async (req, res) => {
 
     const faceId = indexResp.FaceRecords?.[0]?.Face?.FaceId || null;
 
+    // Update user with all required fields including isActive
     await ddb.send(new UpdateCommand({
       TableName: USERS_TABLE,
       Key: { userId },
-      UpdateExpression: 'SET approved = :a, password = :p, faceId = :f, photoKey = :k',
-      ExpressionAttributeValues: { ':a': true, ':p': password, ':f': faceId, ':k': key }
+      UpdateExpression: 'SET approved = :a, password = :p, faceId = :f, photoKey = :k, isActive = :active, approvedAt = :now',
+      ExpressionAttributeValues: { 
+        ':a': true, 
+        ':p': password, 
+        ':f': faceId, 
+        ':k': key,
+        ':active': true,
+        ':now': new Date().toISOString()
+      }
     }));
 
     res.json({ success:true, message: 'User approved and face indexed', faceId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success:false, error: err.message });
+  }
+});
+
+/* ---------- Admin: reject user ---------- */
+app.post('/admin/reject', async (req, res) => {
+  try {
+    const { userId, reason } = req.body;
+    if (!userId) return res.status(400).json({ success: false, error: 'userId required' });
+
+    const userResp = await ddb.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId } }));
+    const user = userResp.Item;
+    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+
+    // Update user as rejected
+    await ddb.send(new UpdateCommand({
+      TableName: USERS_TABLE,
+      Key: { userId },
+      UpdateExpression: 'SET approved = :a, rejected = :r, rejectionReason = :reason, rejectedAt = :now',
+      ExpressionAttributeValues: { 
+        ':a': false, 
+        ':r': true,
+        ':reason': reason || 'No reason provided',
+        ':now': new Date().toISOString()
+      }
+    }));
+
+    res.json({ success: true, message: 'User registration rejected' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -529,13 +567,15 @@ app.get('/admin/users', async (req, res) => {
   try {
     const data = await ddb.send(new ScanCommand({ 
       TableName: USERS_TABLE,
-      FilterExpression: 'approved = :a',
-      ExpressionAttributeValues: { ':a': true }
+      FilterExpression: 'approved = :a AND (attribute_not_exists(isActive) OR isActive = :active)',
+      ExpressionAttributeValues: { ':a': true, ':active': true }
     }));
     
     const users = data.Items || [];
     const students = users.filter(user => user.role === 'student');
     const teachers = users.filter(user => user.role === 'teacher');
+    
+    console.log(`Found ${users.length} approved users: ${students.length} students, ${teachers.length} teachers`);
     
     res.json({ 
       success: true, 
@@ -665,10 +705,11 @@ app.get('/admin/teachers', async (req, res) => {
   try {
     const data = await ddb.send(new ScanCommand({ 
       TableName: USERS_TABLE,
-      FilterExpression: 'approved = :a AND #role = :r',
+      FilterExpression: 'approved = :a AND #role = :r AND (attribute_not_exists(isActive) OR isActive = :active)',
       ExpressionAttributeValues: { 
         ':a': true,
-        ':r': 'teacher'
+        ':r': 'teacher',
+        ':active': true
       },
       ExpressionAttributeNames: {
         '#role': 'role'
@@ -676,15 +717,18 @@ app.get('/admin/teachers', async (req, res) => {
     }));
     
     const teachers = data.Items || [];
+    console.log(`Found ${teachers.length} approved teachers`);
+    
     res.json({ 
       success: true, 
       teachers: teachers.map(teacher => ({
         userId: teacher.userId,
         name: teacher.name,
         email: teacher.email,
-        department: teacher.department,
-        specialization: teacher.specialization,
-        employeeId: teacher.employeeId
+        role: teacher.role,
+        department: teacher.department || 'Not specified',
+        specialization: teacher.specialization || 'Not specified',
+        employeeId: teacher.employeeId || teacher.userId
       }))
     });
   } catch (err) {
@@ -763,6 +807,158 @@ app.get('/teacher/my-classes/:teacherId', async (req, res) => {
         if (dayA !== dayB) return dayA - dayB;
         return a.startTime.localeCompare(b.startTime);
       })
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ---------- Teacher: Get All Students for Attendance ---------- */
+app.get('/teacher/students/:classId', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    
+    // Get all approved students
+    const data = await ddb.send(new ScanCommand({ 
+      TableName: USERS_TABLE,
+      FilterExpression: 'approved = :a AND #role = :r AND (attribute_not_exists(isActive) OR isActive = :active)',
+      ExpressionAttributeValues: { 
+        ':a': true,
+        ':r': 'student',
+        ':active': true
+      },
+      ExpressionAttributeNames: {
+        '#role': 'role'
+      }
+    }));
+    
+    const students = data.Items || [];
+    
+    // Get today's attendance for this class
+    const today = new Date().toISOString().split('T')[0];
+    const attendanceData = await ddb.send(new ScanCommand({ 
+      TableName: ATTENDANCE_TABLE, 
+      FilterExpression: 'contains(sessionId, :c) AND begins_with(#date, :today)', 
+      ExpressionAttributeValues: { ':c': classId, ':today': today },
+      ExpressionAttributeNames: { '#date': 'date' }
+    }));
+    
+    const attendanceRecords = attendanceData.Items || [];
+    const presentStudentIds = new Set(attendanceRecords.map(record => record.userId));
+    
+    // Combine student data with attendance status
+    const studentsWithAttendance = students.map(student => ({
+      ...student,
+      isPresent: presentStudentIds.has(student.userId),
+      attendanceMarked: presentStudentIds.has(student.userId)
+    }));
+    
+    res.json({ 
+      success: true, 
+      students: studentsWithAttendance,
+      classId,
+      date: today
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ---------- Teacher: Manual Attendance Submission ---------- */
+app.post('/teacher/submit-attendance', async (req, res) => {
+  try {
+    const { teacherId, classId, presentStudents, sessionId } = req.body;
+    
+    if (!teacherId || !classId || !Array.isArray(presentStudents)) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    const timestamp = new Date().toISOString();
+    const finalSessionId = sessionId || `MANUAL-${classId}-${Date.now()}`;
+
+    // Create attendance records for present students
+    const attendancePromises = presentStudents.map(async (studentId) => {
+      const attendanceId = `${studentId}-${finalSessionId}`;
+      
+      return ddb.send(new PutCommand({ 
+        TableName: ATTENDANCE_TABLE, 
+        Item: { 
+          attendanceId,
+          userId: studentId,
+          sessionId: finalSessionId,
+          timestamp,
+          date: today,
+          status: 'Present',
+          markedBy: teacherId,
+          method: 'manual'
+        } 
+      }));
+    });
+
+    await Promise.all(attendancePromises);
+
+    res.json({ 
+      success: true, 
+      message: `Attendance marked for ${presentStudents.length} students`,
+      presentCount: presentStudents.length,
+      sessionId: finalSessionId
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ---------- Student: QR Code Scanner with Back Camera Support ---------- */
+app.post('/student/scan-qr', async (req, res) => {
+  try {
+    const { userId, qrData, cameraType } = req.body;
+    
+    if (!userId || !qrData) {
+      return res.status(400).json({ success: false, error: 'Missing fields' });
+    }
+
+    // Validate QR code format and session
+    const sessionResp = await ddb.send(new GetCommand({ 
+      TableName: SESSIONS_TABLE, 
+      Key: { sessionId: qrData } 
+    }));
+    
+    const session = sessionResp.Item;
+    if (!session) {
+      return res.json({ success: false, error: 'Invalid QR code' });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (now > session.expireAt) {
+      return res.json({ success: false, error: 'QR code has expired' });
+    }
+
+    // Mark attendance
+    const today = new Date().toISOString().split('T')[0];
+    const attendanceId = `${userId}-${qrData}`;
+    
+    await ddb.send(new PutCommand({ 
+      TableName: ATTENDANCE_TABLE, 
+      Item: { 
+        attendanceId,
+        userId,
+        sessionId: qrData,
+        timestamp: new Date().toISOString(),
+        date: today,
+        status: 'Present',
+        method: 'qr_scan',
+        cameraUsed: cameraType || 'unknown'
+      } 
+    }));
+
+    res.json({ 
+      success: true, 
+      message: 'Attendance marked successfully via QR scan',
+      classId: session.classId
     });
   } catch (err) {
     console.error(err);
